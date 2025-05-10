@@ -17,9 +17,9 @@ package net.consensys.linea.sequencer.txselection;
 
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import lombok.extern.slf4j.Slf4j;
 import net.consensys.linea.config.LineaProfitabilityConfiguration;
 import net.consensys.linea.config.LineaTracerConfiguration;
 import net.consensys.linea.config.LineaTransactionSelectorConfiguration;
@@ -28,8 +28,8 @@ import net.consensys.linea.metrics.HistogramMetrics;
 import net.consensys.linea.plugins.config.LineaL1L2BridgeSharedConfiguration;
 import net.consensys.linea.rpc.services.BundlePoolService;
 import net.consensys.linea.sequencer.txselection.selectors.LineaTransactionSelector;
+import org.apache.commons.lang3.mutable.MutableLong;
 import org.hyperledger.besu.plugin.data.ProcessableBlockHeader;
-import org.hyperledger.besu.plugin.data.TransactionSelectionResult;
 import org.hyperledger.besu.plugin.services.BlockchainService;
 import org.hyperledger.besu.plugin.services.txselection.BlockTransactionSelectionService;
 import org.hyperledger.besu.plugin.services.txselection.PluginTransactionSelector;
@@ -42,6 +42,7 @@ import org.hyperledger.besu.plugin.services.txselection.SelectorsStateManager;
  *
  * <p>Also provides an entrypoint for bundle transactions
  */
+@Slf4j
 public class LineaTransactionSelectorFactory implements PluginTransactionSelectorFactory {
   private final BlockchainService blockchainService;
   private final Optional<JsonRpcManager> rejectedTxJsonRpcManager;
@@ -98,41 +99,36 @@ public class LineaTransactionSelectorFactory implements PluginTransactionSelecto
 
   public void selectPendingTransactions(
       final BlockTransactionSelectionService bts, final ProcessableBlockHeader pendingBlockHeader) {
-    final AtomicLong cumulativeBundleGasLimit = new AtomicLong(0L);
+    final var bundlesByBlockNumber =
+        bundlePoolService.getBundlesByBlockNumber(pendingBlockHeader.getNumber());
 
-    bundlePoolService
-        .getBundlesByBlockNumber(pendingBlockHeader.getNumber())
-        .forEach(
-            bundle -> {
-              // mark as "to-evaluate" to prevent eviction during processing:
-              bundlePoolService.markBundleForEval(bundle);
-              var badBundleRes =
-                  bundle.pendingTransactions().stream()
-                      .map(
-                          pt -> {
-                            // restricting block bundles on the basis of gasLimit, not gas
-                            // used. gasUsed isn't returned from evaluatePendingTransaction
-                            // currently
-                            final var pendingGasLimit = pt.getTransaction().getGasLimit();
-                            if (pendingGasLimit + cumulativeBundleGasLimit.get()
-                                < maxBundleGasPerBlock) {
-                              var res = bts.evaluatePendingTransaction(pt);
-                              if (res.selected()) {
-                                cumulativeBundleGasLimit.addAndGet(pendingGasLimit);
-                              }
-                              return res;
-                            } else {
-                              return TransactionSelectionResult.BLOCK_OCCUPANCY_ABOVE_THRESHOLD;
-                            }
-                          })
-                      .filter(evalRes -> !evalRes.selected())
-                      .findFirst();
-              if (badBundleRes.isPresent()) {
-                rollback(bts);
-              } else {
-                commit(bts);
-              }
-            });
+    log.atDebug()
+        .setMessage("Bundle pool stats: total={}, for block #{}={}")
+        .addArgument(bundlePoolService::size)
+        .addArgument(pendingBlockHeader::getNumber)
+        .addArgument(bundlesByBlockNumber::size)
+        .log();
+
+    final var cumulativeBundleGasLimit = new MutableLong(0L);
+
+    bundlesByBlockNumber.forEach(
+        bundle -> {
+          log.trace("Starting evaluation of bundle {}", bundle);
+          // mark as "to-evaluate" to prevent eviction during processing:
+          bundlePoolService.markBundleForEval(bundle);
+          var badBundleRes =
+              bundle.pendingTransactions().stream()
+                  .map(bts::evaluatePendingTransaction)
+                  .filter(evalRes -> !evalRes.selected())
+                  .findFirst();
+          if (badBundleRes.isPresent()) {
+            log.trace("Failed bundle {}, reason {}", bundle, badBundleRes);
+            rollback(bts);
+          } else {
+            log.trace("Selected bundle {}", bundle);
+            commit(bts);
+          }
+        });
     currSelector.set(null);
   }
 
